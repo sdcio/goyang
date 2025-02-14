@@ -1,4 +1,4 @@
-module github.com/openconfig/goyang
+module github.com/sdcio/goyang
 
 go 1.14
 
