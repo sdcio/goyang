@@ -2970,8 +2970,9 @@ func mustReadFile(path string) string {
 
 func TestDeviation(t *testing.T) {
 	type deviationTest struct {
-		path  string
-		entry *Entry // entry is the entry that is wanted at a particular path, if a field is left as nil, it is not checked.
+		path             string
+		entry            *Entry // entry is the entry that is wanted at a particular path, if a field is left as nil, it is not checked.
+		wantExtsKeywords []string // keywords that must appear in entry.Exts after deviation is applied
 	}
 	tests := []struct {
 		desc                    string
@@ -3658,6 +3659,123 @@ func TestDeviation(t *testing.T) {
 				},
 			},
 		},
+	}, {
+		desc: "deviate add propagates extensions onto target entry",
+		inFiles: map[string]string{
+			"sdcio-ext": `
+				module sdcio-ext {
+					prefix "sdcio-ext";
+					namespace "urn:sdcio-ext";
+					extension sensitive {
+						description "Marks a leaf as containing sensitive data.";
+					}
+				}`,
+			"target": `
+				module target {
+					prefix "t";
+					namespace "urn:t";
+					import sdcio-ext { prefix "sdcio-ext"; }
+
+					leaf auth-password { type string; }
+
+					deviation /auth-password {
+						deviate add {
+							sdcio-ext:sensitive;
+						}
+					}
+				}`,
+		},
+		wants: map[string][]deviationTest{
+			"target": {{
+				path:             "/auth-password",
+				entry:            &Entry{},
+				wantExtsKeywords: []string{"sdcio-ext:sensitive"},
+			}},
+		},
+	}, {
+		desc: "deviate replace propagates extensions onto target entry",
+		inFiles: map[string]string{
+			"sdcio-ext": `
+				module sdcio-ext {
+					prefix "sdcio-ext";
+					namespace "urn:sdcio-ext";
+					extension sensitive {
+						description "Marks a leaf as containing sensitive data.";
+					}
+				}`,
+			"target": `
+				module target {
+					prefix "t";
+					namespace "urn:t";
+					import sdcio-ext { prefix "sdcio-ext"; }
+
+					leaf auth-password { type string; }
+
+					deviation /auth-password {
+						deviate replace {
+							sdcio-ext:sensitive;
+						}
+					}
+				}`,
+		},
+		wants: map[string][]deviationTest{
+			"target": {{
+				path:             "/auth-password",
+				entry:            &Entry{},
+				wantExtsKeywords: []string{"sdcio-ext:sensitive"},
+			}},
+		},
+	}, {
+		desc: "deviate replace replaces existing extensions, does not accumulate",
+		inFiles: map[string]string{
+			"tag-ext": `
+				module tag-ext {
+					prefix "tag-ext";
+					namespace "urn:tag-ext";
+					extension old-tag {
+						description "A pre-existing extension on the leaf.";
+					}
+				}`,
+			"sdcio-ext": `
+				module sdcio-ext {
+					prefix "sdcio-ext";
+					namespace "urn:sdcio-ext";
+					extension sensitive {
+						description "Marks a leaf as containing sensitive data.";
+					}
+				}`,
+			"base": `
+				module base {
+					prefix "b";
+					namespace "urn:b";
+					import tag-ext { prefix "tag-ext"; }
+
+					leaf auth-password {
+						type string;
+						tag-ext:old-tag;
+					}
+				}`,
+			"overlay": `
+				module overlay {
+					prefix "o";
+					namespace "urn:o";
+					import base { prefix "b"; }
+					import sdcio-ext { prefix "sdcio-ext"; }
+
+					deviation /b:auth-password {
+						deviate replace {
+							sdcio-ext:sensitive;
+						}
+					}
+				}`,
+		},
+		wants: map[string][]deviationTest{
+			"base": {{
+				path:             "/auth-password",
+				entry:            &Entry{},
+				wantExtsKeywords: []string{"sdcio-ext:sensitive"},
+			}},
+		},
 	}}
 
 	for _, tt := range tests {
@@ -3765,13 +3883,23 @@ func TestDeviation(t *testing.T) {
 						wantMust = append(wantMust, m.(*Must).Name)
 					}
 
-					MustDiff := cmp.Diff(wantMust, gotMust)
-					if MustDiff != "" {
-						t.Errorf("Must deviation mismatch (-want +got):\n%s", MustDiff)
+				MustDiff := cmp.Diff(wantMust, gotMust)
+				if MustDiff != "" {
+					t.Errorf("Must deviation mismatch (-want +got):\n%s", MustDiff)
+				}
+
+				if len(want.wantExtsKeywords) > 0 {
+					gotKeywords := make([]string, 0, len(got.Exts))
+					for _, ext := range got.Exts {
+						gotKeywords = append(gotKeywords, ext.Keyword)
+					}
+					if diff := cmp.Diff(want.wantExtsKeywords, gotKeywords, cmpopts.SortSlices(func(a, b string) bool { return a < b })); diff != "" {
+						t.Errorf("%d (%s): Exts keywords mismatch (-want +got):\n%s", idx, want.path, diff)
 					}
 				}
 			}
-		})
+		}
+	})
 	}
 }
 
