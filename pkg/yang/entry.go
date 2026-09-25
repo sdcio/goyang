@@ -113,9 +113,21 @@ type Entry struct {
 	// is a module only.
 	Identities []*Identity `json:",omitempty"`
 
-	Augments   []*Entry                   `json:",omitempty"` // Augments defined in this entry.
-	Augmented  []*Entry                   `json:",omitempty"` // Augments merged into this entry.
-	Deviations []*DeviatedEntry           `json:"-"`          // Deviations associated with this entry.
+	Augments  []*Entry `json:",omitempty"` // Augments defined in this entry.
+	Augmented []*Entry `json:",omitempty"` // Augments merged into this entry.
+	// Collisions holds, per local name, the full standalone subtree of
+	// every child that lost a naming collision during merge (e.g. two
+	// cross-module augments, or an augment and the base module,
+	// introducing a child with the same local name at the same target).
+	// Without this, merge would otherwise silently discard the losing
+	// child (see merge's "Duplicate node" error, which is recorded via
+	// addError but easy for callers to miss). The winning child remains
+	// reachable the normal way, via Dir[name]; callers that need every
+	// candidate at a given (parent, name) position -- e.g. to resolve
+	// ambiguity by owning module -- should consult both Dir[name] and
+	// Collisions[name].
+	Collisions map[string][]*Entry        `json:",omitempty"`
+	Deviations []*DeviatedEntry           `json:"-"` // Deviations associated with this entry.
 	Deviate    map[deviationType][]*Entry `json:"-"`
 	// deviationPresence tracks whether certain attributes for a DeviateEntry-type
 	// Entry have been given deviation values.
@@ -1777,6 +1789,22 @@ func (e *Entry) dup() *Entry {
 	return &ne
 }
 
+// Candidates returns every child entry known to e for local name, in the
+// order they were encountered during schema compilation: the winning entry
+// reachable via Dir[name] (if any) followed by every entry that lost a
+// naming collision against it (see Collisions and merge). Most callers
+// should keep using Dir[name] directly; use Candidates when a bare local
+// name is genuinely ambiguous and every candidate needs to be considered,
+// e.g. to disambiguate by owning module.
+func (e *Entry) Candidates(name string) []*Entry {
+	var candidates []*Entry
+	if w := e.Dir[name]; w != nil {
+		candidates = append(candidates, w)
+	}
+	candidates = append(candidates, e.Collisions[name]...)
+	return candidates
+}
+
 // merge merges a duplicate of oe.Dir into e.Dir, setting the prefix of each
 // element to prefix, if not nil.  It is an error if e and oe contain common
 // elements.
@@ -1790,17 +1818,28 @@ func (e *Entry) merge(prefix *Value, namespace *Value, oe *Entry) {
 		if namespace != nil {
 			v.namespace = namespace
 		}
+		v.Parent = e
+		v.Exts = append(v.Exts, oe.Exts...)
+		for lk := range oe.Extra {
+			v.Extra[lk] = append(v.Extra[lk], oe.Extra[lk]...)
+		}
 		if se := e.Dir[k]; se != nil {
 			er := newError(oe.Node, `Duplicate node %q in %q from:
    %s: %s
    %s: %s`, k, e.Name, Source(v.Node), v.Name, Source(se.Node), se.Name)
 			e.addError(er.Errors[0])
-		} else {
-			v.Parent = e
-			v.Exts = append(v.Exts, oe.Exts...)
-			for lk := range oe.Extra {
-				v.Extra[lk] = append(v.Extra[lk], oe.Extra[lk]...)
+
+			// v lost the naming collision against the entry already
+			// in e.Dir[k]. Historically it was silently dropped here.
+			// Retain it as a fully-populated, standalone entry so
+			// callers can still reach it instead of losing the data
+			// (e.g. real Cisco IOS-XR schemas have cross-module
+			// augments that legitimately collide this way).
+			if e.Collisions == nil {
+				e.Collisions = make(map[string][]*Entry)
 			}
+			e.Collisions[k] = append(e.Collisions[k], v)
+		} else {
 			e.Dir[k] = v
 		}
 	}

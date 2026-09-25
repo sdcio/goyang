@@ -698,6 +698,159 @@ module groupings {
 	},
 }
 
+// testAugmentCollisionModules reproduces the real Cisco IOS-XR pattern
+// (see .scratch/cisco-ios-xr-schema-collision/issues/10) where two
+// independent modules each augment the same target with a child that
+// shares a local name -- here, two modules augment "/base:root" with a
+// container named "clash", each with a distinguishing leaf so tests can
+// tell which one won the merge and which one collided.
+var testAugmentCollisionModules = []struct {
+	name string
+	in   string
+}{
+	{
+		name: "base.yang",
+		in: `
+module base {
+  namespace "urn:base";
+  prefix "base";
+
+  container root {
+    leaf marker {
+      type string;
+    }
+  }
+}
+`,
+	},
+	{
+		name: "augment-one.yang",
+		in: `
+module augment-one {
+  namespace "urn:augment-one";
+  prefix "aug1";
+
+  import base {
+    prefix base;
+  }
+
+  augment "/base:root" {
+    container clash {
+      leaf from-one {
+        type string;
+      }
+      container from-one-nested {
+        leaf inner {
+          type string;
+        }
+      }
+    }
+  }
+}
+`,
+	},
+	{
+		name: "augment-two.yang",
+		in: `
+module augment-two {
+  namespace "urn:augment-two";
+  prefix "aug2";
+
+  import base {
+    prefix base;
+  }
+
+  augment "/base:root" {
+    container clash {
+      leaf from-two {
+        type string;
+      }
+    }
+  }
+}
+`,
+	},
+}
+
+func TestAugmentMergeCollisionRetainsLoser(t *testing.T) {
+	ms := NewModules()
+	for _, tt := range testAugmentCollisionModules {
+		if err := ms.Parse(tt.in, tt.name); err != nil {
+			t.Fatalf("could not parse module %s: %v", tt.name, err)
+		}
+	}
+
+	// Modules.Process()'s own returned []error does not surface this
+	// error: its augment-error-collection pass only re-queries modules
+	// whose augment target was never found (see the `mods` loop in
+	// Process()), which both augment-one and augment-two are not -- their
+	// target ("/base:root") resolves fine, the *merge* is what collides.
+	// Callers that need to detect merge collisions must inspect
+	// GetErrors() on the affected entries directly (e.g. per-module,
+	// as schema-server does after yang.ToEntry(m)), which is what we
+	// assert on below.
+	if errs := ms.Process(); len(errs) != 0 {
+		t.Fatalf("Process() returned unexpected errors: %v", errs)
+	}
+
+	rootEntry := ToEntry(ms.Modules["base"]).Dir["root"]
+
+	var foundDuplicate bool
+	for _, err := range rootEntry.GetErrors() {
+		if strings.Contains(err.Error(), `Duplicate node "clash"`) {
+			foundDuplicate = true
+		}
+	}
+	if !foundDuplicate {
+		t.Fatalf("expected a %q error among rootEntry.GetErrors(), got: %v", `Duplicate node "clash"`, rootEntry.GetErrors())
+	}
+
+	winner := rootEntry.Dir["clash"]
+	if winner == nil {
+		t.Fatalf("expected root.Dir[%q] to still hold the winning augment's child, got nil", "clash")
+	}
+
+	losers := rootEntry.Collisions["clash"]
+	if len(losers) != 1 {
+		t.Fatalf("expected exactly one collision loser for %q, got %d: %+v", "clash", len(losers), losers)
+	}
+	loser := losers[0]
+
+	// The two augments are distinguishable by their leaves: augment-one's
+	// "clash" has "from-one" (+ a nested container), augment-two's has
+	// only "from-two". Whichever one is *not* the winner must still be
+	// fully reachable via Collisions, with its own subtree intact
+	// (not truncated the way shallowDup would leave it).
+	if _, ok := winner.Dir["from-one"]; ok {
+		if _, ok := loser.Dir["from-two"]; !ok {
+			t.Fatalf("expected collision loser to be augment-two's clash (from-two), got children: %v", dirNames(loser))
+		}
+	} else if _, ok := winner.Dir["from-two"]; ok {
+		if _, ok := loser.Dir["from-one"]; !ok {
+			t.Fatalf("expected collision loser to be augment-one's clash (from-one), got children: %v", dirNames(loser))
+		}
+		if _, ok := loser.Dir["from-one-nested"]; !ok {
+			t.Fatalf("expected collision loser's nested descendant to survive (not be truncated), got children: %v", dirNames(loser))
+		}
+	} else {
+		t.Fatalf("winner has neither from-one nor from-two, got children: %v", dirNames(winner))
+	}
+
+	// Candidates should surface both the winner and the loser.
+	candidates := rootEntry.Candidates("clash")
+	if len(candidates) != 2 {
+		t.Fatalf("expected Candidates(%q) to return 2 entries, got %d", "clash", len(candidates))
+	}
+}
+
+func dirNames(e *Entry) []string {
+	var names []string
+	for name := range e.Dir {
+		names = append(names, name)
+	}
+	return names
+}
+
 func TestAugmentedEntry(t *testing.T) {
 	ms := NewModules()
 	for _, tt := range testAugmentAndUsesModules {
@@ -2137,6 +2290,9 @@ var testIfFeatureModules = []struct {
 
   grouping g {
 	container gc {}
+	leaf rf {
+		type string;
+	}
   }
 }
 `,
@@ -2971,7 +3127,7 @@ func mustReadFile(path string) string {
 func TestDeviation(t *testing.T) {
 	type deviationTest struct {
 		path             string
-		entry            *Entry // entry is the entry that is wanted at a particular path, if a field is left as nil, it is not checked.
+		entry            *Entry   // entry is the entry that is wanted at a particular path, if a field is left as nil, it is not checked.
 		wantExtsKeywords []string // keywords that must appear in entry.Exts after deviation is applied
 	}
 	tests := []struct {
@@ -3883,23 +4039,23 @@ func TestDeviation(t *testing.T) {
 						wantMust = append(wantMust, m.(*Must).Name)
 					}
 
-				MustDiff := cmp.Diff(wantMust, gotMust)
-				if MustDiff != "" {
-					t.Errorf("Must deviation mismatch (-want +got):\n%s", MustDiff)
-				}
-
-				if len(want.wantExtsKeywords) > 0 {
-					gotKeywords := make([]string, 0, len(got.Exts))
-					for _, ext := range got.Exts {
-						gotKeywords = append(gotKeywords, ext.Keyword)
+					MustDiff := cmp.Diff(wantMust, gotMust)
+					if MustDiff != "" {
+						t.Errorf("Must deviation mismatch (-want +got):\n%s", MustDiff)
 					}
-					if diff := cmp.Diff(want.wantExtsKeywords, gotKeywords, cmpopts.SortSlices(func(a, b string) bool { return a < b })); diff != "" {
-						t.Errorf("%d (%s): Exts keywords mismatch (-want +got):\n%s", idx, want.path, diff)
+
+					if len(want.wantExtsKeywords) > 0 {
+						gotKeywords := make([]string, 0, len(got.Exts))
+						for _, ext := range got.Exts {
+							gotKeywords = append(gotKeywords, ext.Keyword)
+						}
+						if diff := cmp.Diff(want.wantExtsKeywords, gotKeywords, cmpopts.SortSlices(func(a, b string) bool { return a < b })); diff != "" {
+							t.Errorf("%d (%s): Exts keywords mismatch (-want +got):\n%s", idx, want.path, diff)
+						}
 					}
 				}
 			}
-		}
-	})
+		})
 	}
 }
 
