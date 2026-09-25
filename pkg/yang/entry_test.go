@@ -2290,6 +2290,9 @@ var testIfFeatureModules = []struct {
 
   grouping g {
 	container gc {}
+	leaf rf {
+		type string;
+	}
   }
 }
 `,
